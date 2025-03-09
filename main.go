@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gocolly/colly/v2"
 	"github.com/jung-kurt/gofpdf"
@@ -26,6 +30,7 @@ func main() {
 	baseURLFlag := flag.String("url", "", "The starting URL to scrape (required)")
 	maxDepth := flag.Int("depth", 2, "Maximum depth for crawling links (default: 2)")
 	outputFile := flag.String("output", "output.pdf", "Output PDF file name (default: output.pdf)")
+	timeoutSecs := flag.Int("timeout", 300, "Timeout in seconds for the entire scraping process (default: 300)")
 	flag.Parse()
 
 	// Validate URL
@@ -45,11 +50,34 @@ func main() {
 	pages := []Page{}
 	visitedURLs := make(map[string]bool)
 
-	// Initialize the collector
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSecs)*time.Second)
+	defer cancel()
+
+	// Initialize the collector with configuration
 	c := colly.NewCollector(
 		colly.AllowedDomains(domain),
 		colly.MaxDepth(*maxDepth),
+		colly.Async(true),
 	)
+
+	// Set timeouts and limits
+	c.SetRequestTimeout(30 * time.Second)
+
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: 2,
+		Delay:       1 * time.Second,
+		RandomDelay: 1 * time.Second,
+	})
+
+	// Handle errors
+	c.OnError(func(r *colly.Response, err error) {
+		fmt.Printf("Error scraping %s: %v\n", r.Request.URL, err)
+	})
+
+	// Create mutex for thread-safe operations
+	var mu sync.Mutex
 
 	// Create PDF
 	pdf := gofpdf.New("P", "mm", "A4", "")
@@ -106,6 +134,7 @@ func main() {
 			}
 		})
 
+		mu.Lock()
 		pages = append(pages, Page{
 			Title:    title,
 			Content:  content.String(),
@@ -113,6 +142,7 @@ func main() {
 			Headings: headings,
 			Code:     codeBlocks,
 		})
+		mu.Unlock()
 
 		visitedURLs[currentURL] = true
 
@@ -136,14 +166,43 @@ func main() {
 		})
 	})
 
+	// Create a channel to signal completion
+	done := make(chan bool)
+
+	// Start a goroutine to check for timeout
+	go func() {
+		select {
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				fmt.Printf("\nScraping timed out after %d seconds. Processing collected pages...\n", *timeoutSecs)
+				done <- true
+			}
+		case <-done:
+			return
+		}
+	}()
+
 	// Start scraping
 	err = c.Visit(baseURL)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error visiting base URL: %v\n", err)
+		if len(pages) == 0 {
+			log.Fatal("No pages were scraped. Exiting.")
+		}
 	}
 
-	// Wait for all scraping to complete
+	// Wait for scraping to complete or timeout
 	c.Wait()
+	done <- true
+
+	// Sort pages by URL to ensure consistent ordering
+	mu.Lock()
+	sort.Slice(pages, func(i, j int) bool {
+		return pages[i].URL < pages[j].URL
+	})
+	mu.Unlock()
+
+	fmt.Printf("\nScraped %d pages successfully.\n", len(pages))
 
 	// Generate PDF with TOC
 	pdf.AddPage()
